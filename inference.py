@@ -15,7 +15,7 @@ CKPT_DIR = "ckpts"
 N_MELS = 160
 CUTTING_PROBABILITY = 0.5           # Threshold for mask binarization
 
-DEBUG_SAVE_NOISE_INJECTED = True
+DEBUG_SAVE_NOISE_INJECTED = False
 
 SILENCE_TARGET_DURATION = 0.100     # Duration of injected silence ( seconds )
 REJECT_MASKS_BELOW_LENGTH = 0.150   # Minimum duration to keep a mask ( seconds )
