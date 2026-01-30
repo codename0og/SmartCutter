@@ -1,0 +1,11 @@
+# IGNORE
+env/*
+DEV/*
+infer_input/*
+infer_output/*
+training_files/*
+
+# Keep
+!infer_input/.gitkeep
+!infer_output/.gitkeep
+!training_files/.gitkeep

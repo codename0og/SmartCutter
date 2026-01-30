@@ -1,0 +1,13 @@
+# Core dependencies
+numpy==1.26.4
+
+# Audio processing
+scipy==1.11.1
+soundfile==0.12.1
+
+# Machine learning and deep learning
+torch==2.7.1
+torchaudio==2.7.1
+
+# Miscellaneous utilities
+tqdm
