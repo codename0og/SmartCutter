@@ -5,6 +5,7 @@ infer_input/*
 infer_output/*
 training_files/*
 validation_files/*
+ckpts/*
 *.pyc
 
 # Keep
@@ -12,3 +13,4 @@ validation_files/*
 !infer_output/.gitkeep
 !training_files/.gitkeep
 !validation_files/.gitkeep
+!ckpts/.gitkeep
