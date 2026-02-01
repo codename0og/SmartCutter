@@ -14,7 +14,7 @@
 
 ### <p align="center"> Machine Learning based silence-truncation. <br/> Made with Applio / RVC and my Codename-RVC-Fork-4 in mind. ✨ <br/> <br/>
 ### Features:
-- Automatically truncates the silences ( whether dirty / noisy or not ). <br/>
+- Automatically truncates the silences ( whether dirty / noisy or not.. tho there's limits. It's not a noise-gate trimmer afterall haha. ). <br/>
 `While trying to ensure more or less consistent ~100ms spacings ( Some deviations are present and expected. )`
 - Respects zero-crossing boundaries.
 - Respects breathing ( hopefully.. can't promise much if they're too quiet or way too much noise-like. ).
@@ -50,13 +50,21 @@ Run the installation script:
 
 - Double-click `install.bat`.
  
+### PRETRAINED MODELS:
+
+- Download all 3 checkpoints ( Each ~54mb ):)<br/>
+[model_48000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_48000.pth?download=true)<br/>
+[model_40000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_40000.pth?download=true)<br/>
+[model_32000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_32000.pth?download=true)<br/>
+- Put them in SmartCutter's "ckpts" folder
+ 
 ### INFERENCE:
  
 To start inference:
 - First put the concatenated sample or samples ( .wav or .flac ) into "infer_input" dir.
 - Double-click `run-infer.bat`.
 - Results will land in "infer_output" dir.<br/>
-`( Concatenated = Simply join up all samples / segments into 1 file )`<br/>`NOTE: ( supports multiple samples AND multiple sr. )`
+`( Concatenated = Simply join up all samples / segments into 1 file )`<br/><br/>`NOTE: supports multiple samples AND multiple sr.`
  
 ### TRAINING:
 - Training of custom pretrains is supported. <br/> Instruction regarding that will be published in future.
