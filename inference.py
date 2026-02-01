@@ -1,195 +1,548 @@
+import os
+import sys
 import torch
 import torchaudio
-import os
+import torchaudio.functional as F_audio
 import glob
 import numpy as np
-import scipy.signal
-import scipy.ndimage
+import math
+import gc
 
-from model import SmartCutterUNet
+from model_v3 import DSCA_ResUNet_v3
 
 # --- CONFIG ---
 IN_DIR = "infer_input"
 OUT_DIR = "infer_output"
 CKPT_DIR = "ckpts"
 N_MELS = 160
-CUTTING_PROBABILITY = 0.5           # Threshold for mask binarization
-
-DEBUG_SAVE_NOISE_INJECTED = False
-
-SILENCE_TARGET_DURATION = 0.100     # Duration of injected silence ( seconds )
-REJECT_MASKS_BELOW_LENGTH = 0.150   # Minimum duration to keep a mask ( seconds )
-GAP_FILL_THRESHOLD = 0.100 # 0.050          # Bridge gaps in masks smaller than 50ms
-SEARCH_WINDOW_MS = 5                # Window size for Zero-Crossing search
 
 
-def inject_targeted_noise(waveform, sr, min_silence_len=0.100, buffer_ms=10):
-    is_zero = (waveform.abs() < 1e-6).float()
+# --- INFER AND PROCESSING CONFIG ---
+FORCE_CPU = False                                       #   By default runs with GPU Acceleration ( CUDA )
+MASK_MODE = "Soft"                                      #   Available:  "Soft", "Hard", "PowerMean" and "Hybrid"
+DEBUG_MASK_PRED = False                                 #   Set to True if you need to debug / predict the model's prediction on your samples.
+SAVE_EXTENSION = "wave_16"                              #   Available:  "flac", "wave_16" and "wave_32float"
 
-    min_samples = int(sr * min_silence_len)
-    buffer_samples = int(sr * (buffer_ms / 1000))
 
-    eroded = -torch.nn.functional.max_pool1d(-is_zero.unsqueeze(0), kernel_size=min_samples, stride=1, padding=min_samples//2).squeeze(0)
-    silence_mask = torch.nn.functional.max_pool1d(eroded.unsqueeze(0), kernel_size=min_samples, stride=1, padding=min_samples//2).squeeze(0)
+# --- SMART CUTTER CONFIG ( Safe defaults. ) ---
+SILENCE_TARGET_DURATION = 0.100                     #   The target duration for silence gaps (e.g. 500ms gap / silence --> 100ms)
+MIN_SEGMENT_DURATION_MS = 100                       #   Minimum length for detected spots to count as viable for cutting ( 100ms, safe default. )
 
-    shrink_samples = buffer_samples * 2
-    targeted_mask = -torch.nn.functional.max_pool1d(-silence_mask.unsqueeze(0), kernel_size=shrink_samples, stride=1, padding=shrink_samples//2).squeeze(0)
 
-    targeted_mask = targeted_mask[:, :waveform.shape[1]]
 
-    # Inject Noise (-65dB RMS approx)
-    noise = torch.randn_like(waveform) * 0.00055
-    return waveform + (targeted_mask * noise)
+# Do not tweak these!
+SEARCH_WINDOW_MS = 25
+FADE_DURATION_MS = 10
+CUTTING_PROBABILITY = 0.5
+SAFETY_BUFFER_MS = 5
+TARGET_STEP_SEC = 60.0 # segmentation / chunking length
+MARGIN_SEC = 2.0
+
+#  Not properly supported yet. Likely in next / more proper models' revision.
+STABILITY_NOISE = False                  #   Injects subtle noise into pure silence to stabilize the model
+STABILITY_DB_LEVEL = -70.0               #   The dB level of the injected noise
+STABILITY_FADE_MS = 4                    #   Fade duration (ms) for the injected noise edges to be softer
+
+
+def get_cosine_fade(length, device):
+    # Generates a raised cosine curve (half-Hanning).
+    # It's mathematically smoother than a linear fade, protecting spectral integrity.
+    t = torch.linspace(0, math.pi, length, device=device)
+    fade_curve = 0.5 * (1 - torch.cos(t))
+    return fade_curve
+
+def apply_fade(waveform, fade_samples, mode="both"):
+    # Applies the cosine fade
+    if waveform.shape[1] < fade_samples * 2:
+        return waveform
+
+    fade_curve = get_cosine_fade(fade_samples, waveform.device)
+
+    if mode == "in" or mode == "both":
+        # Fade In: curve goes 0 -> 1
+        waveform[:, :fade_samples] *= fade_curve
+
+    if mode == "out" or mode == "both":
+        # Fade Out: flip the curve so it goes 1 -> 0
+        waveform[:, -fade_samples:] *= fade_curve.flip(0)
+
+    return waveform
+
+def inject_stability_noise(wav, sr, device):
+    """
+    Finds exact digital silence (0.0) and injects soft-enveloped noise.
+    """
+    # 1. Create Noise Tensor
+    noise_amp = 10 ** (STABILITY_DB_LEVEL / 20.0)
+    
+    # Identify silence regions (1 for silence, 0 for audio)
+    # wav is [1, T]
+    silence_mask = (wav.squeeze(0) == 0.0).float()
+    
+    # Find edges: 1 (start of silence), -1 (end of silence)
+    diff = torch.diff(silence_mask, prepend=torch.tensor([0.0], device=device), append=torch.tensor([0.0], device=device))
+    
+    starts = torch.where(diff == 1)[0]
+    ends = torch.where(diff == -1)[0]
+    
+    if len(starts) == 0:
+        return wav
+
+    # Generate a master noise tensor for efficiency
+    full_noise = torch.randn_like(wav) * noise_amp
+    
+    fade_samples = int(sr * (STABILITY_FADE_MS / 1000.0))
+    
+    # Process each silence gap
+    for start, end in zip(starts, ends):
+        length = end - start
+        if length <= 0: continue
+        
+        # Extract noise chunk
+        noise_chunk = full_noise[:, start:end].clone()
+        
+        # Apply fade to noise chunk so it doesn't have hard edges
+        # If the gap is tiny, the fades might overlap, apply_fade handles that gracefully-ish or we skip.
+        if length > fade_samples * 2:
+            noise_chunk = apply_fade(noise_chunk, fade_samples, mode="both")
+        else:
+            # For tiny gaps, just window it completely
+            window = torch.hann_window(length, device=device)
+            noise_chunk *= window
+            
+        # Inject
+        wav[:, start:end] = noise_chunk
+
+    return wav
+
+def find_cuts(mask, waveform, sr):
+    # Heavy lifter for phase-aware cutting:
+    # 1. Finds rough cut points based on the prediction mask.
+    # 2. FILTERS segments < 100ms
+    # 3. Scans the actual audio for Zero Crossings (where signal crosses 0).
+    # 4. Snaps the rough cuts to the nearest Zero Crossing to prevent clicking/popping.
+
+    if mask.device.type != 'cpu': mask = mask.cpu()
+    if waveform.device.type != 'cpu': waveform = waveform.cpu()
+
+    mask_binary = (mask > CUTTING_PROBABILITY).float()
+
+    # Identify edges of silence: 1 is start of silence, -1 is end.
+    diff = torch.diff(mask_binary, prepend=torch.tensor([0]), append=torch.tensor([0]))
+
+    rough_starts = torch.where(diff == 1)[0]
+    rough_ends = torch.where(diff == -1)[0]
+
+    if len(rough_starts) == 0:
+        return [], []
+
+    # Convert ms to samples
+    min_samples = int(sr * (MIN_SEGMENT_DURATION_MS / 1000.0))
+
+    # Calculate durations for all found segments
+    durations = rough_ends - rough_starts
+
+    # Keep only indices where duration >= min_samples
+    valid_indices = torch.where(durations >= min_samples)[0]
+
+    if len(valid_indices) == 0:
+        return [], []
+
+    # Update starts and ends to only include valid segments
+    rough_starts = rough_starts[valid_indices]
+    rough_ends = rough_ends[valid_indices]
+
+    buffer_samples = int(sr * (SAFETY_BUFFER_MS / 1000.0))
+    
+    rough_starts = rough_starts + buffer_samples
+    rough_ends = rough_ends - buffer_samples
+
+    # Ensure we didn't invert the segment (start > end) after shrinking
+    # This theoretically shouldn't happen if Min > 2*Buffer (100ms > 10ms), but better safe than sorry.
+    valid_shrink = rough_ends > rough_starts
+    rough_starts = rough_starts[valid_shrink]
+    rough_ends = rough_ends[valid_shrink]
+    # Flatten to mono to find crossings.
+    wav_mono = waveform.mean(dim=0) 
+
+    # Calculate differences in sign to find exact crossing indices.
+    zero_crossings = torch.diff(torch.sign(wav_mono))
+
+    # We want indices where the sign actually changed.
+    valid_zc_indices = torch.where(zero_crossings != 0)[0]
+
+    # If the audio is pure silence or DC offset, fallback to rough cuts.
+    if len(valid_zc_indices) == 0:
+        return rough_starts, rough_ends
+
+    # Helper to find the index in 'candidates' closest to 'targets'.
+    def snap_to_nearest(targets, candidates):
+        # Find insertion points.
+        idx = torch.searchsorted(candidates, targets)
+
+        # Keep within array bounds.
+        idx = torch.clamp(idx, 0, len(candidates) - 1)
+        prev_idx = torch.clamp(idx - 1, 0, len(candidates) - 1)
+
+        val_at_idx = candidates[idx]
+        val_at_prev = candidates[prev_idx]
+
+        # Check if the previous neighbor was actually closer.
+        dist_idx = torch.abs(targets - candidates[idx])
+        dist_prev = torch.abs(targets - candidates[prev_idx])
+
+        return torch.where(dist_prev < dist_idx, candidates[prev_idx], candidates[idx])
+
+    search_win_samples = int(sr * (SEARCH_WINDOW_MS / 1000))
+
+    # Snap rough cuts to the nearest safe zero-crossing.
+    safe_starts = snap_to_nearest(rough_starts, valid_zc_indices)
+    safe_ends = snap_to_nearest(rough_ends, valid_zc_indices)
+
+    # If the nearest ZC is too far away, just use the rough cut.
+    start_diff = torch.abs(safe_starts - rough_starts)
+    safe_starts = torch.where(start_diff < search_win_samples, safe_starts, rough_starts)
+
+    end_diff = torch.abs(safe_ends - rough_ends)
+    safe_ends = torch.where(end_diff < search_win_samples, safe_ends, rough_ends)
+
+    return safe_starts, safe_ends
 
 def SmartCutter(waveform, mask, sr=48000):
-    device = mask.device
+    waveform = waveform.cpu()
+    mask = mask.cpu()
+
     target_size = waveform.shape[1]
 
-    # Ensure device consistency
-    if waveform.device != device:
-        waveform = waveform.to(device)
+    # Interpolate the low-res mask up to the full audio resolution.
+    if mask.dim() == 1: mask = mask.view(1, 1, -1)
+    elif mask.dim() == 2: mask = mask.unsqueeze(1)
 
-    # gpu interpolation
     mask_full = torch.nn.functional.interpolate(
         mask, size=target_size, mode='linear', align_corners=True
-    )
+    ).squeeze()
 
-    # Binarization
-    binary_mask = (mask_full > CUTTING_PROBABILITY).float()
+    # Calculate where to cut.
+    starts, ends = find_cuts(mask_full, waveform, sr)
 
-    # Safety; Bridge tiny flickers ( Binary Closing )
-    fill_samples = int(sr * GAP_FILL_THRESHOLD)
-    pad_f = fill_samples // 2
-    dilated = torch.nn.functional.max_pool1d(binary_mask, fill_samples, 1, pad_f)
-    binary_mask = -torch.nn.functional.max_pool1d(-dilated, fill_samples, 1, pad_f)
+    # If mask is empty, return silence.
+    if len(starts) == 0:
+        return torch.zeros_like(waveform), mask_full
 
-    # Safety;  Reject too short masks ( Binary Opening )
-    min_samples = int(sr * REJECT_MASKS_BELOW_LENGTH)
-    pad_s = min_samples // 2
-
-    # Erosion (MinPool)
-    eroded = -torch.nn.functional.max_pool1d(
-        -binary_mask, kernel_size=min_samples, stride=1, padding=pad_s
-    )
-    # Dilation (MaxPool)
-    opened_mask = torch.nn.functional.max_pool1d(
-        eroded, kernel_size=min_samples, stride=1, padding=pad_s
-    )
-
-    # Identify points & Zero-Crossing Reconstruction
-    mask_cpu = opened_mask.squeeze().cpu().numpy() > 0.5
-    diff = np.diff(mask_cpu.astype(int), prepend=0, append=0)
-    starts = np.where(diff == 1)[0]
-    ends = np.where(diff == -1)[0]
-
-    # Zero-Crossing reconstruction
     target_silence_samples = int(sr * SILENCE_TARGET_DURATION)
-    search_win = int(sr * (SEARCH_WINDOW_MS / 1000))
+    fade_samples = int(sr * (FADE_DURATION_MS / 1000))
+
     pieces = []
-    last_idx = 0
+    last_valid_idx = 0
 
-    for start, end in zip(starts, ends):
-        # Search for Zero-Crossing to prevent clicks
-        win_start = max(0, start - search_win)
-        win_end = min(target_size, start + search_win)
-        segment = waveform[0, win_start:win_end]
+    # Pre-allocate silence
+    silence_tensor = torch.zeros((waveform.shape[0], target_silence_samples))
 
-        # Find index where waveform crosses or touches 0
-        zero_cross = torch.argmin(torch.abs(segment)).item()
-        safe_start = win_start + zero_cross
+    start_list = starts.tolist()
+    end_list = ends.tolist()
 
-        # Append Speech with silence bits
-        pieces.append(waveform[:, last_idx:safe_start])
+    for start_idx, end_idx in zip(start_list, end_list):
+        start_idx = int(start_idx)
+        end_idx = int(end_idx)
 
-        # Generate pure silence
-        pieces.append(torch.zeros((waveform.shape[0], target_silence_samples), device=device))
+        # Only process if there's actual data to cut.
+        if start_idx > last_valid_idx:
+            speech_chunk = waveform[:, last_valid_idx:start_idx].clone()
 
-        last_idx = end
+            # Apply fades to the edges of the chunk to prevent clicks.
+            if last_valid_idx > 0:
+                speech_chunk = apply_fade(speech_chunk, fade_samples, mode="in")
 
-    pieces.append(waveform[:, last_idx:])
-    return torch.cat(pieces, dim=1).cpu()
+            speech_chunk = apply_fade(speech_chunk, fade_samples, mode="out")
+            pieces.append(speech_chunk)
+
+        # Insert clean silence between chunks.
+        pieces.append(silence_tensor)
+        last_valid_idx = end_idx
+
+    # Handle any remaining audio at the end.
+    if last_valid_idx < target_size:
+        tail_chunk = waveform[:, last_valid_idx:].clone()
+        if last_valid_idx > 0:
+            tail_chunk = apply_fade(tail_chunk, fade_samples, mode="in")
+        pieces.append(tail_chunk)
+
+    # Merge everything back into one tensor.
+    return torch.cat(pieces, dim=1), mask_full
+
+def process_grid_aligned(model, transform, waveform, sr, hop_length, device, static_input_buffer):
+    # Implements Weighted Overlap-Add (WOLA) inference.
+    # Processes audio in overlapping chunks and averages the results.
+    total_samples = waveform.shape[1]
+
+    CHUNK_SEC = TARGET_STEP_SEC
+    OVERLAP_SEC = CHUNK_SEC / 2
+
+    chunk_samples = int(CHUNK_SEC * sr)
+    overlap_samples = int(OVERLAP_SEC * sr)
+    stride_samples = chunk_samples - overlap_samples
+
+    # Dummy pass to get dimensions
+    dummy_input = torch.zeros(1, chunk_samples, device=device)
+    dummy_mel = transform(dummy_input)
+    frames_per_chunk = dummy_mel.shape[-1]
+
+    # Total framess estimation for CPU buffer allocation
+    total_frames = int(math.ceil(total_samples / hop_length)) + 100 # ample buffer
+
+    print(f"    -> WOLA chunking: Chunk={chunk_samples}, Overlap={overlap_samples}, Total Frames={total_frames}")
+
+    # Accumulators for the final mask and the window weights.
+    mask_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
+    weight_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
+
+    # Hanning window ensures the center of the prediction counts more than the edges.
+    window = torch.hann_window(frames_per_chunk, device=device).view(1, -1)
+    # Moving window to CPU for accumulation later
+    window_cpu = window.cpu()
+
+    current_sample = 0
+
+    with torch.no_grad():
+        while current_sample < total_samples:
+            start = current_sample
+            end = start + chunk_samples
+
+            chunk_wav = waveform[:, start:end]
+
+            # Pad
+            original_len = chunk_wav.shape[1]
+            if original_len < chunk_samples:
+                pad_amt = chunk_samples - original_len
+                chunk_wav = torch.nn.functional.pad(chunk_wav, (0, pad_amt))
+
+            # Move a chunk to GPU
+            chunk_wav = chunk_wav.to(device)
+
+            # Inference
+            raw_mask = _run_inference(model, transform, chunk_wav, device, static_input_buffer)
+
+            if raw_mask.dim() == 3: raw_mask = raw_mask.squeeze(1)
+
+            # Map to frames
+            start_frame = int(round(start / hop_length))
+
+            # Ensure we don't go out of bounds
+            if start_frame + frames_per_chunk > mask_accumulator.shape[1]:
+                 # Expand CPU buffer dynamically if needed
+                 extra = (start_frame + frames_per_chunk) - mask_accumulator.shape[1]
+                 mask_accumulator = torch.nn.functional.pad(mask_accumulator, (0, extra))
+                 weight_accumulator = torch.nn.functional.pad(weight_accumulator, (0, extra))
+
+            # Accumulate on CPU
+            current_pred_cpu = raw_mask.cpu() # Move pred to CPU
+
+            # Add weighted prediction to accumulator.
+            mask_accumulator[:, start_frame : start_frame + frames_per_chunk] += (current_pred_cpu * window_cpu)
+            weight_accumulator[:, start_frame : start_frame + frames_per_chunk] += window_cpu
+
+            current_sample += stride_samples
+
+    # Normalize by weights to get the final average.
+    weight_accumulator[weight_accumulator < 1e-6] = 1.0
+    final_mask = mask_accumulator / weight_accumulator
+
+    # Trim to actual size based on input waveform
+    actual_frames = int(total_samples / hop_length)
+    final_mask = final_mask[:, :actual_frames]
+
+    return final_mask
+
+def _run_inference(model, mel_transform, wav_chunk, device, input_buffer):
+    # Standard forward pass: Waveform -> Mel -> Delta -> Model -> Mask.
+    mel = mel_transform(wav_chunk).squeeze(0)
+    mel = torchaudio.transforms.AmplitudeToDB()(mel)
+
+    # Normalize dB to 0-1 range.
+    min_db, max_db = -80.0, 0.0
+    mel = torch.clamp(mel, min=min_db, max=max_db)
+    mel = (mel - min_db) / (max_db - min_db)
+
+    # Compute deltas for extra temporal context.
+    delta = F_audio.compute_deltas(mel.unsqueeze(0)).squeeze(0)
+
+    # buffer pushing
+    current_frames = mel.shape[-1]
+    input_buffer[0, 0, :, :current_frames].copy_(mel)
+    input_buffer[0, 1, :, :current_frames].copy_(delta)
+
+    # Model Inference using the buffer slice
+    mask_2d = model(input_buffer[:, :, :, :current_frames])
+
+    # Collapse 2D output (freq/time) to 1D (time) based on strategy.
+    if MASK_MODE == "Soft": mask_pred = torch.mean(mask_2d, dim=2)
+    elif MASK_MODE == "Hybrid":
+        soft_mask = torch.mean(mask_2d, dim=2)
+        hard_mask = torch.max(mask_2d, dim=2)[0]
+        mask_pred = (0.7 * soft_mask) + (0.3 * hard_mask)
+    elif MASK_MODE == "PowerMean":
+        mask_pred = torch.sqrt(torch.mean(mask_2d**2, dim=2))
+    elif MASK_MODE == "Hard":
+        mask_pred = torch.max(mask_2d, dim=2)[0]
+    else:
+        print(f"MASK_MODE: {MASK_MODE} is unsupported. Exiting.")
+        sys.exit(1)
+
+    return mask_pred
 
 def processing():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device setup
+    if FORCE_CPU:
+        device = torch.device("cpu")
+        print("FORCE_CPU is True. Using CPU.")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        torch.backends.cudnn.benchmark = False # For consistency we disable it.
+        print(f"CUDA available. Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device("cpu")
+        print("CUDA not available. Using CPU.")
 
-    # Setup Dirs
     os.makedirs(IN_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    files = glob.glob(os.path.join(IN_DIR, "*.wav"))
+    files = glob.glob(os.path.join(IN_DIR, "*.wav")) + glob.glob(os.path.join(IN_DIR, "*.flac"))
     print(f"Found {len(files)} files.")
 
-    # Cache models and transforms to avoid reloading
     loaded_models = {}
 
+    # Loop
     for f_path in files:
-        fname = os.path.basename(f_path)
-        print(f"Processing: {fname}...")
+        try:
+            fname = os.path.basename(f_path)
+            print(f"Processing: {fname}...")
 
-        wav, sr = torchaudio.load(f_path)
+            # Audio loading
+            wav, sr = torchaudio.load(f_path)
 
-        # Ensure consistent hop scaling with rvc standards.
-        current_hop = sr // 100
+            # If audio is stereo, we pick the one with the lowest DC offset
+            if wav.shape[0] > 1:
+                # Calculate absolute mean (DC offset) for each channel
+                dc_offsets = torch.abs(wav.mean(dim=1))
 
-        # Ensure an appropriate model is loaded
-        if sr not in loaded_models:
-            model_path = os.path.join(CKPT_DIR, f"model_{sr}.pth")
-            if not os.path.exists(model_path):
-                print(f"Skipping {fname}: No model found for {sr}Hz at {model_path}")
-                continue
+                # Find the index of the channel with the minimum offset
+                best_ch_idx = torch.argmin(dc_offsets)
 
-            print(f"Switching to {sr}Hz model (Hop: {current_hop})...")
-            model = SmartCutterUNet(n_channels=N_MELS).to(device)
-            model.load_state_dict(torch.load(model_path, map_location=device))
-            model.eval()
+                # Select that channel and keep dimensions as [1, Time]
+                wav = wav[best_ch_idx].unsqueeze(0)
 
-            mel_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=sr, 
-                n_mels=N_MELS, 
-                n_fft=2048, 
-                hop_length=current_hop
-            ).to(device)
+                print(f"    -> Converted Stereo to Mono (Selected Ch {best_ch_idx}, DC: {dc_offsets[best_ch_idx]:.6f})")
 
-            loaded_models[sr] = (model, mel_transform)
-        curr_model, curr_mel_transform = loaded_models[sr]
+            if STABILITY_NOISE:
+                wav = inject_stability_noise(wav, sr, wav.device)
 
-        # Inference pipeline
-        with torch.no_grad():
-            wav_dev = wav.to(device)
+            # Dynamic model loading based on Sample Rate.
+            current_hop = sr // 100
+            if sr not in loaded_models:
+                # Release previous model if switching SR
+                if len(loaded_models) > 0:
+                    print("Unloading previous model to free VRAM...")
+                    loaded_models.clear()
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
 
-            # Inject -65~ db gaussian noise in pure digital silence segments, that are 100ms+
-            wav_for_model = inject_targeted_noise(wav_dev, sr)
+                model_path = os.path.join(CKPT_DIR, f"model_{sr}.pth")
+                if not os.path.exists(model_path):
+                    print(f"Skipping {fname}: No model for {sr}Hz")
+                    continue
 
-            if DEBUG_SAVE_NOISE_INJECTED:
-                debug_fname = fname.replace(".wav", "_noise_injected.wav")
-                debug_path = os.path.join(OUT_DIR, debug_fname)
-                torchaudio.save(debug_path, wav_for_model.cpu(), sr)
-                print(f"Debug file saved: {debug_path}")
+                print(f"Loading {sr}Hz model...")
+                model = DSCA_ResUNet_v3(n_channels=2).to(device)
+                model.load_state_dict(torch.load(model_path, map_location=device))
+                model.eval()
 
-            # Pad to match standard mel windowing
-            pad_len = 2048
-            wav_padded = torch.nn.functional.pad(wav_for_model, (0, pad_len))
+                mel_transform = torchaudio.transforms.MelSpectrogram(
+                    sample_rate=sr, n_mels=N_MELS, n_fft=2048, hop_length=current_hop
+                ).to(device)
 
-            mel = curr_mel_transform(wav_padded)
-            mel = torchaudio.transforms.AmplitudeToDB()(mel)
+                # we're pre-allocating a static buffer for the model input
+                # Shape: [Batch, Channels, Mel_Bins, Frames_per_60s_chunk]
+                # Channels = 2 (Mel + Delta)
+                dummy_frames = int(math.ceil((TARGET_STEP_SEC * sr) / current_hop)) + 5
+                static_buffer = torch.zeros((1, 2, N_MELS, dummy_frames), device=device)
 
-            # Normalization logic
-            m_std = mel.std()
-            if m_std > 0.1:
-                mel = (mel - mel.mean()) / (m_std + 1e-6)
+                loaded_models[sr] = (model, mel_transform, static_buffer)
+
+            curr_model, curr_mel_transform, curr_buffer = loaded_models[sr]
+
+            # Inference (GPU-accelerated, CPU accumulation)
+            mel_mask = process_grid_aligned(curr_model, curr_mel_transform, wav, sr, current_hop, device, curr_buffer)
+
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            # SmartCutter on CPU.
+            cleaned, binary_mask = SmartCutter(wav, mel_mask, sr=sr)
+
+            # Debug section
+            if DEBUG_MASK_PRED:
+                if binary_mask.dim() > 2: binary_mask = binary_mask.squeeze(0)
+
+                binary_mask_interpolated = torch.nn.functional.interpolate(
+                    binary_mask.view(1,1,-1), size=wav.shape[1], mode='nearest'
+                ).squeeze()
+
+                debug_noise = torch.randn_like(wav) * 0.09
+                debug_wav = wav + (debug_noise * (binary_mask_interpolated > CUTTING_PROBABILITY).float())
+                torchaudio.save(os.path.join(OUT_DIR, "debug_" + os.path.basename(f_path)), debug_wav, sr)
+
+            out_path = os.path.join(OUT_DIR, fname)
+
+            # Volume Normalization
+            peak = torch.abs(cleaned).max()
+            if peak >= 0.95:
+                scale_factor = 0.95 / peak.item()
+                cleaned = cleaned * scale_factor
+
+            # Saving
+            if SAVE_EXTENSION == "flac":
+                torchaudio.save(out_path, cleaned, sr, bits_per_sample=16)
+            elif SAVE_EXTENSION == "wave_16":
+                torchaudio.save(out_path, cleaned, sr, encoding="PCM_S", bits_per_sample=16)
+            elif SAVE_EXTENSION == "wave_32float":
+                torchaudio.save(out_path, cleaned, sr, encoding="PCM_F", bits_per_sample=32)
             else:
-                mel = torch.full_like(mel, -5.0)
+                print(f"Specified saving extension: '{SAVE_EXTENSION}' is unsupported. Exiting.")
+                sys.exit(1)
 
-            # Predict
-            mask_pred = curr_model(mel)
+            print(f"Saved: {out_path}")
 
-        # Cut
-        cleaned = SmartCutter(wav, mask_pred, sr=sr)
+            # Cleanup
 
-        # Save
-        out_path = os.path.join(OUT_DIR, fname)
-        torchaudio.save(out_path, cleaned, sr)
-        print(f"Saved: {out_path}")
+            # inputs and outputs
+            if 'wav' in locals(): del wav
+            if 'cleaned' in locals(): del cleaned
+
+            # masks and intermediate tensors
+            if 'binary_mask' in locals(): del binary_mask
+            if 'mel_mask' in locals(): del mel_mask
+
+            # Delete debug pieces
+            if 'debug_wav' in locals(): del debug_wav
+            if 'debug_noise' in locals(): del debug_noise
+            if 'binary_mask_interpolated' in locals(): del binary_mask_interpolated
+
+            # Current buffer ( GPU )
+            if 'curr_buffer' in locals(): curr_buffer.zero_()
+
+            gc.collect()
+
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"Error processing {f_path}: {e}")
+            del e
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            continue
 
 if __name__ == "__main__":
     processing()

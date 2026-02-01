@@ -1,11 +1,14 @@
-# IGNORE
+# Ignore
 env/*
 DEV/*
 infer_input/*
 infer_output/*
 training_files/*
+validation_files/*
+*.pyc
 
 # Keep
 !infer_input/.gitkeep
 !infer_output/.gitkeep
 !training_files/.gitkeep
+!validation_files/.gitkeep
