@@ -3,45 +3,50 @@ import sys
 import torch
 import torchaudio
 import torchaudio.functional as F_audio
+import soundfile as sf
 import glob
 import numpy as np
 import math
 import gc
 
+from model_v5 import CGA_ResUNet
 from model_v3 import DSCA_ResUNet_v3
 
-# --- CONFIG ---
-IN_DIR = "infer_input"
-OUT_DIR = "infer_output"
-CKPT_DIR = "ckpts"
-N_MELS = 160
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-
-# --- INFER AND PROCESSING CONFIG ---
+#  INFER AND PROCESSING CONFIG
+MODEL_VERSION = "v3"
 FORCE_CPU = False                                       #   By default runs with GPU Acceleration ( CUDA )
 MASK_MODE = "Soft"                                      #   Available:  "Soft", "Hard", "PowerMean" and "Hybrid"
 DEBUG_MASK_PRED = False                                 #   Set to True if you need to debug / predict the model's prediction on your samples.
 SAVE_EXTENSION = "wave_16"                              #   Available:  "flac", "wave_16" and "wave_32float"
 
+#  SMART CUTTER CONFIG ( Safe defaults. )
+SILENCE_TARGET_DURATION = 0.100                         #   The target duration for silence gaps (e.g. 500ms gap / silence --> 100ms)
+MIN_SEGMENT_DURATION_MS = 100                           #   Minimum length for detected spots to count as viable for cutting ( 100ms, safe default. )
 
-# --- SMART CUTTER CONFIG ( Safe defaults. ) ---
-SILENCE_TARGET_DURATION = 0.100                     #   The target duration for silence gaps (e.g. 500ms gap / silence --> 100ms)
-MIN_SEGMENT_DURATION_MS = 100                       #   Minimum length for detected spots to count as viable for cutting ( 100ms, safe default. )
+#  PREDICTION STABILIZATION
+STABILITY_NOISE = False                                 #   Injects subtle noise into pure silence to stabilize the model
+STABILITY_DB_LEVEL = -75.0                              #   The dB level of the injected noise  ( -80 is minimum;  Model's limitation. )
+STABILITY_FADE_MS = 1                                   #   Fade duration (ms) for the injected noise edges to be softer
+ENABLE_BRIDGING = True                                  #   Filling of the mask/prediction gaps - Only use when and if you debug the mask output and notice gaps.
+
+#  PATHS
+IN_DIR = "infer_input"
+OUT_DIR = "infer_output"
+CKPT_DIR = "ckpts"
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 
 
-# Do not tweak these!
+# Estabilished safe params, do not tweak these unless necessary and you know what you're doing.
 SEARCH_WINDOW_MS = 25
 FADE_DURATION_MS = 10
 CUTTING_PROBABILITY = 0.5
 SAFETY_BUFFER_MS = 5
-TARGET_STEP_SEC = 60.0 # segmentation / chunking length
-MARGIN_SEC = 2.0
+SEGMENT_LEN = 8.0
 
-#  Not properly supported yet. Likely in next / more proper models' revision.
-STABILITY_NOISE = False                  #   Injects subtle noise into pure silence to stabilize the model
-STABILITY_DB_LEVEL = -70.0               #   The dB level of the injected noise
-STABILITY_FADE_MS = 4                    #   Fade duration (ms) for the injected noise edges to be softer
 
 
 def get_cosine_fade(length, device):
@@ -70,47 +75,41 @@ def apply_fade(waveform, fade_samples, mode="both"):
 
 def inject_stability_noise(wav, sr, device):
     """
-    Finds exact digital silence (0.0) and injects soft-enveloped noise.
+    Injects steady, neutral colored noise
     """
-    # 1. Create Noise Tensor
     noise_amp = 10 ** (STABILITY_DB_LEVEL / 20.0)
-    
-    # Identify silence regions (1 for silence, 0 for audio)
-    # wav is [1, T]
+
     silence_mask = (wav.squeeze(0) == 0.0).float()
-    
-    # Find edges: 1 (start of silence), -1 (end of silence)
     diff = torch.diff(silence_mask, prepend=torch.tensor([0.0], device=device), append=torch.tensor([0.0], device=device))
-    
     starts = torch.where(diff == 1)[0]
     ends = torch.where(diff == -1)[0]
-    
+
     if len(starts) == 0:
         return wav
 
-    # Generate a master noise tensor for efficiency
-    full_noise = torch.randn_like(wav) * noise_amp
-    
+    raw_noise = torch.randn_like(wav)
+
+    alpha = 0.85
+    neutral_noise = torchaudio.functional.lfilter(
+        raw_noise, 
+        torch.tensor([1.0, 0.0], device=device), 
+        torch.tensor([1.0, -alpha], device=device)
+    )
+    neutral_noise *= noise_amp
     fade_samples = int(sr * (STABILITY_FADE_MS / 1000.0))
-    
-    # Process each silence gap
+
     for start, end in zip(starts, ends):
         length = end - start
         if length <= 0: continue
-        
-        # Extract noise chunk
-        noise_chunk = full_noise[:, start:end].clone()
-        
-        # Apply fade to noise chunk so it doesn't have hard edges
-        # If the gap is tiny, the fades might overlap, apply_fade handles that gracefully-ish or we skip.
+
+        noise_chunk = neutral_noise[:, start:end].clone()
+
         if length > fade_samples * 2:
             noise_chunk = apply_fade(noise_chunk, fade_samples, mode="both")
         else:
-            # For tiny gaps, just window it completely
             window = torch.hann_window(length, device=device)
             noise_chunk *= window
-            
-        # Inject
+
         wav[:, start:end] = noise_chunk
 
     return wav
@@ -212,11 +211,19 @@ def SmartCutter(waveform, mask, sr=48000):
     waveform = waveform.cpu()
     mask = mask.cpu()
 
-    target_size = waveform.shape[1]
+    if ENABLE_BRIDGING:
+        # Gap bridge operation
+        bridge_frames = 5 # At 100fps, 50ms is ~5 frames
+        mask = mask.view(1, 1, -1)
+
+        mask = torch.nn.functional.max_pool1d(mask, bridge_frames, 1, bridge_frames//2) # Dilation
+        mask = -torch.nn.functional.max_pool1d(-mask, bridge_frames, 1, bridge_frames//2) # Erosion
 
     # Interpolate the low-res mask up to the full audio resolution.
     if mask.dim() == 1: mask = mask.view(1, 1, -1)
     elif mask.dim() == 2: mask = mask.unsqueeze(1)
+
+    target_size = waveform.shape[1]
 
     mask_full = torch.nn.functional.interpolate(
         mask, size=target_size, mode='linear', align_corners=True
@@ -275,7 +282,7 @@ def process_grid_aligned(model, transform, waveform, sr, hop_length, device, sta
     # Processes audio in overlapping chunks and averages the results.
     total_samples = waveform.shape[1]
 
-    CHUNK_SEC = TARGET_STEP_SEC
+    CHUNK_SEC = SEGMENT_LEN
     OVERLAP_SEC = CHUNK_SEC / 2
 
     chunk_samples = int(CHUNK_SEC * sr)
@@ -329,10 +336,10 @@ def process_grid_aligned(model, transform, waveform, sr, hop_length, device, sta
 
             # Ensure we don't go out of bounds
             if start_frame + frames_per_chunk > mask_accumulator.shape[1]:
-                 # Expand CPU buffer dynamically if needed
-                 extra = (start_frame + frames_per_chunk) - mask_accumulator.shape[1]
-                 mask_accumulator = torch.nn.functional.pad(mask_accumulator, (0, extra))
-                 weight_accumulator = torch.nn.functional.pad(weight_accumulator, (0, extra))
+                # Expand CPU buffer dynamically if needed
+                extra = (start_frame + frames_per_chunk) - mask_accumulator.shape[1]
+                mask_accumulator = torch.nn.functional.pad(mask_accumulator, (0, extra))
+                weight_accumulator = torch.nn.functional.pad(weight_accumulator, (0, extra))
 
             # Accumulate on CPU
             current_pred_cpu = raw_mask.cpu() # Move pred to CPU
@@ -375,7 +382,8 @@ def _run_inference(model, mel_transform, wav_chunk, device, input_buffer):
     mask_2d = model(input_buffer[:, :, :, :current_frames])
 
     # Collapse 2D output (freq/time) to 1D (time) based on strategy.
-    if MASK_MODE == "Soft": mask_pred = torch.mean(mask_2d, dim=2)
+    if MASK_MODE == "Soft":
+        mask_pred = torch.mean(mask_2d, dim=2)
     elif MASK_MODE == "Hybrid":
         soft_mask = torch.mean(mask_2d, dim=2)
         hard_mask = torch.max(mask_2d, dim=2)[0]
@@ -430,15 +438,23 @@ def processing():
 
                 # Select that channel and keep dimensions as [1, Time]
                 wav = wav[best_ch_idx].unsqueeze(0)
-
                 print(f"    -> Converted Stereo to Mono (Selected Ch {best_ch_idx}, DC: {dc_offsets[best_ch_idx]:.6f})")
 
+            wav_for_inference = wav.clone()
+
+            # Safety norm on input
+            input_peak = torch.abs(wav_for_inference).max()
+            if input_peak > 0:
+                target_peak = 0.9 
+                wav_for_inference = wav_for_inference * (target_peak / input_peak)
+
             if STABILITY_NOISE:
-                wav = inject_stability_noise(wav, sr, wav.device)
+                wav_for_inference = inject_stability_noise(wav_for_inference, sr, wav.device)
 
             # Dynamic model loading based on Sample Rate.
             current_hop = sr // 100
             if sr not in loaded_models:
+
                 # Release previous model if switching SR
                 if len(loaded_models) > 0:
                     print("Unloading previous model to free VRAM...")
@@ -447,24 +463,40 @@ def processing():
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
 
-                model_path = os.path.join(CKPT_DIR, f"model_{sr}.pth")
+                model_path = os.path.join(CKPT_DIR, f"{MODEL_VERSION}_model_{sr}.pth")
                 if not os.path.exists(model_path):
-                    print(f"Skipping {fname}: No model for {sr}Hz")
+                    print(f"Skipping {fname}: No {MODEL_VERSION} model for {sr}Hz")
                     continue
 
-                print(f"Loading {sr}Hz model...")
-                model = DSCA_ResUNet_v3(n_channels=2).to(device)
+                print(f"Loading {sr}Hz {MODEL_VERSION} model ...")
+
+                if MODEL_VERSION == "v3":
+                    model = DSCA_ResUNet_v3(n_channels=2, n_classes=1).to(device)   # v3
+                elif MODEL_VERSION == "v5":
+                    model = CGA_ResUNet(n_channels=2, n_classes=1).to(device)       # v5
+                else:
+                    print(f"'{MODEL_VERSION}' is not a valid model version choice. Exiting.")
+                    sys.exit(1)
+
                 model.load_state_dict(torch.load(model_path, map_location=device))
                 model.eval()
 
+                # mel transform config
+                if sr in [48000, 40000]:
+                    N_FFT = 2048
+                    N_MELS = 160
+                else:
+                    N_FFT = 1024 # for 32khz model variant.
+                    N_MELS = 128
+
                 mel_transform = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=sr, n_mels=N_MELS, n_fft=2048, hop_length=current_hop
+                    sample_rate=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=current_hop
                 ).to(device)
 
                 # we're pre-allocating a static buffer for the model input
                 # Shape: [Batch, Channels, Mel_Bins, Frames_per_60s_chunk]
                 # Channels = 2 (Mel + Delta)
-                dummy_frames = int(math.ceil((TARGET_STEP_SEC * sr) / current_hop)) + 5
+                dummy_frames = int(math.ceil((SEGMENT_LEN * sr) / current_hop)) + 5
                 static_buffer = torch.zeros((1, 2, N_MELS, dummy_frames), device=device)
 
                 loaded_models[sr] = (model, mel_transform, static_buffer)
@@ -472,7 +504,7 @@ def processing():
             curr_model, curr_mel_transform, curr_buffer = loaded_models[sr]
 
             # Inference (GPU-accelerated, CPU accumulation)
-            mel_mask = process_grid_aligned(curr_model, curr_mel_transform, wav, sr, current_hop, device, curr_buffer)
+            mel_mask = process_grid_aligned(curr_model, curr_mel_transform, wav_for_inference, sr, current_hop, device, curr_buffer)
 
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -492,7 +524,6 @@ def processing():
                 debug_wav = wav + (debug_noise * (binary_mask_interpolated > CUTTING_PROBABILITY).float())
                 torchaudio.save(os.path.join(OUT_DIR, "debug_" + os.path.basename(f_path)), debug_wav, sr)
 
-            out_path = os.path.join(OUT_DIR, fname)
 
             # Volume Normalization
             peak = torch.abs(cleaned).max()
@@ -500,9 +531,16 @@ def processing():
                 scale_factor = 0.95 / peak.item()
                 cleaned = cleaned * scale_factor
 
+            # Output path construction
+            file_stem = os.path.splitext(fname)[0]
+            if SAVE_EXTENSION == "flac":
+                out_path = os.path.join(OUT_DIR, file_stem + ".flac")
+            elif "wave" in SAVE_EXTENSION:
+                out_path = os.path.join(OUT_DIR, file_stem + ".wav")
+
             # Saving
             if SAVE_EXTENSION == "flac":
-                torchaudio.save(out_path, cleaned, sr, bits_per_sample=16)
+                torchaudio.save(out_path, cleaned, sr, format="flac", backend="soundfile")
             elif SAVE_EXTENSION == "wave_16":
                 torchaudio.save(out_path, cleaned, sr, encoding="PCM_S", bits_per_sample=16)
             elif SAVE_EXTENSION == "wave_32float":
@@ -518,6 +556,7 @@ def processing():
             # inputs and outputs
             if 'wav' in locals(): del wav
             if 'cleaned' in locals(): del cleaned
+            if 'wav_for_inference' in locals(): del wav_for_inference
 
             # masks and intermediate tensors
             if 'binary_mask' in locals(): del binary_mask

@@ -9,7 +9,7 @@ if /i "%cd%"=="C:\Windows\System32" (
 )
 
 setlocal
-title SmartCutter Inference
+title SmartCutter Training
 
 if not exist env (
     echo Please run 'run-install.bat' first to set up the environment.
@@ -17,6 +17,6 @@ if not exist env (
     exit /b 1
 )
 
-env\python.exe inference.py
+env\python.exe train_v5.py
 echo.
 pause

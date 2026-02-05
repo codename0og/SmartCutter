@@ -17,6 +17,6 @@ if not exist env (
     exit /b 1
 )
 
-env\python.exe train.py --open
+env\python.exe train_v3.py
 echo.
 pause
