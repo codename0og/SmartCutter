@@ -20,20 +20,22 @@
 - Respects breathing ( hopefully.. can't promise much if they're too quiet or way too much noise-like. ).
 - Doesn't damage word-tails or inter-phonetic gaps ( unlike gating )
 - Truncated areas are automatically replaced by pure silence ( in case of noise-contamination between words or sentences. ).
-- No need for user input when it comes to adjusting any params or values. All auto.
+- No need for user input when it comes to adjusting any params or values. All's handled automatically.
 
 
 ㅤ
 <br/>
 # ⚠️ㅤ**IMPORTANT** ㅤ⚠️
-- Models are in prototype stage. They're trained on limited dataset. Better ones expected in some time.
 - For now only CUDA ( nvidia ) or CPU.
 - Supported sample rates: 32, 40 and 48khz.<br/>
 - Silence / Sub-Silence ( noisy ) spacings below 100ms are ignored / not processed by design.
+- There are limits, it is still a very-low-noise or pure silence focused truncator.
+( So keep in mind models might hiccup on some really hard cases. ) <br/>
 <br/>
  
 ✨ to-do list ✨
-> - Better pretrained models.
+> - ~~Better pretrained models.~~ done.
+> - Eventually ( potentially ) move over to v5 arch ~ Bigger dataset's needed.
  
 💡 Ideas / concepts 💡
 > - Currently none. Open to your ideas ~
@@ -53,9 +55,9 @@ Run the installation script:
 ### PRETRAINED MODELS:
 
 - Download all 3 checkpoints ( Each ~54mb ):)<br/>
-[model_48000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_48000.pth?download=true)<br/>
-[model_40000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_40000.pth?download=true)<br/>
-[model_32000](https://huggingface.co/Codename0/SmartCutter/resolve/main/model_32000.pth?download=true)<br/>
+[v3_model_48000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_48000.pth?download=true)<br/>
+[v3_model_40000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_40000.pth?download=true)<br/>
+[v3_model_32000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_32000.pth?download=true)<br/>
 - Put them in SmartCutter's "ckpts" folder
  
 ### INFERENCE:
