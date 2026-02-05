@@ -9,7 +9,6 @@
 
 <p align="center"> ㅤㅤ👆 To stay up-to-date with advancements, hang out or get support 👆ㅤㅤ </p>
 
-
 ## <p align="center"> A lil bit more about the project:
 
 ### <p align="center"> Machine Learning based silence-truncation. <br/> Made with Applio / RVC and my Codename-RVC-Fork-4 in mind. ✨ <br/> <br/>
@@ -22,6 +21,11 @@
 - Truncated areas are automatically replaced by pure silence ( in case of noise-contamination between words or sentences. ).
 - No need for user input when it comes to adjusting any params or values. All's handled automatically.
 
+## Scenarios it handles very reliably:
+<img width="1621" height="755" alt="image" src="https://github.com/user-attachments/assets/5da19052-61db-47e5-88e7-90bf76311c60" /> <br/>
+## Scenarios it might fail or the reliability is uncertain:
+### 1. <img width="1621" height="751" alt="image" src="https://github.com/user-attachments/assets/1fa04d01-57cf-43c0-b3f1-1bbf819dbbaf" /> <br>
+### 2. <img width="1630" height="759" alt="image" src="https://github.com/user-attachments/assets/5638f038-62c2-4904-8268-0de2caeb941f" />
 
 ㅤ
 <br/>
