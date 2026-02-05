@@ -26,7 +26,7 @@
 ## Scenarios it might fail or the reliability is uncertain:
 ### 1. <img width="1621" height="751" alt="image" src="https://github.com/user-attachments/assets/1fa04d01-57cf-43c0-b3f1-1bbf819dbbaf" /> <br>
 ### 2. <img width="1630" height="759" alt="image" src="https://github.com/user-attachments/assets/5638f038-62c2-4904-8268-0de2caeb941f" />
-
+### Therefore, for such " hard cases " ( 1, 2 ) spectral de-noise ( or gating if you're careful ) is recommended.
 ㅤ
 <br/>
 # ⚠️ㅤ**IMPORTANT** ㅤ⚠️
